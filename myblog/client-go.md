@@ -1,3 +1,13 @@
+---
+title: client-go源码机制
+date: 2025-01-15
+update: 2025-03-02
+comment: false
+tags:
+  - kubernetes
+categories:
+  - kubernetes
+---
 # Client-go中的模块
 
 - Reflector: Reflector从apiserver去watch特定类型的资源，拿到变更通知后，将其放入DeltaFIFO队列当中

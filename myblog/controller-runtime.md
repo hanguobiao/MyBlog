@@ -1,3 +1,14 @@
+---
+title: controller-runtime源码机制
+date: 2025-01-23
+update: 2025-03-02
+comment: false
+tags:
+  - kubernetes
+categories:
+  - kubernetes
+---
+
 Kubebuilder是一个开发Operator的脚手架，提供代码库封装底层的K8s client-go
 
 实现上基于社区的Controller-Runtime框架，这里就详细探究一下Controller-Runtime的代码实现
