@@ -8,6 +8,11 @@ tags:
 categories:
   - kubernetes
 ---
+如果你正在写Kubernetes的Operator或者对这一机制感兴趣，那么就绕不开Client-go。作为 Kubernetes 控制器开发的核心框架，client-go的许多机制是Kubernetes二次开发绕不开的基石，本文将带您深入剖析其核心架构组件
+
+参考：https://github.com/daniel-hutao/Advanced-Kubernetes-Operator
+
+*<!--more-->*
 # Client-go中的模块
 
 - Reflector: Reflector从apiserver去watch特定类型的资源，拿到变更通知后，将其放入DeltaFIFO队列当中

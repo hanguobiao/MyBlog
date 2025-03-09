@@ -8,10 +8,9 @@ tags:
 categories:
   - kubernetes
 ---
+目前的Operator开发模式是使用Kubebuilder框架来开发，Kubebuilder是一个开发Operator的脚手架，基于Controller-Runtime实现。 用户在Kubebuilder使用开发Operator时只需要关注自身的业务逻辑，也就是承载业务逻辑的Reconciler。或许你会有疑问Reconciler是如何触发，这里就详细探究一下Controller-Runtime的代码实现。
 
-Kubebuilder是一个开发Operator的脚手架，提供代码库封装底层的K8s client-go
-
-实现上基于社区的Controller-Runtime框架，这里就详细探究一下Controller-Runtime的代码实现
+*<!--more-->*
 
 # Informer
 
