@@ -250,4 +250,3 @@ Netfilter 执行完成后，调用回调函数 `ip_rcv_finish()`。
    1. XDP 可能是能力最受限的，因为它只是设计用来做**快速丢包**（fast dropping）和 **非本地重定向**（non-local redirecting）；但另一方面，它又是最快的程序，因为 它在整个 datapath 的最前面，具备对整个 datapath 进行短路处理（short circuit the entire datapath）的能力。
    2. tc 和 iptables 程序能方便地 mangle 数据包，而不会对原来的转发流程产生显著影响。
 
-理解这些东西非常重要，因为**这是 Cilium 乃至广义 datapath 里非常核心的东西**。如 果遇到底层网络问题，或者需要做 Cilium/kernel 调优，那你必须要理解包的收发/转发 路径，有时你会发现包的某些路径非常反直觉。

@@ -1,3 +1,21 @@
+---
+title: （译）BPF and XDP Reference Guide
+date: 2025-03-05
+update: 2025-03-09
+comment: false
+tags:
+  - Cilium
+  - BPF
+categories:
+  - BPF
+---
+
+本文内容翻译自Cilium文档：https://docs.cilium.io/en/stable/reference-guides/bpf/
+
+个人认为这篇文档是入门BPF和了解Cilium的首选，所以就翻译了这篇文档，用于平时学习BPF和Cilium。
+
+*<!--more-->*
+
 BPF（Berkeley Packet Filter，伯克利包过滤器）是 Linux 内核中一种高度灵活且高效的类虚拟机结构，允许以安全的方式在各种hook点执行字节码。它被广泛应用于 Linux 内核的多个子系统中，最突出的是网络、追踪和安全（例如沙箱）。
 
 cilium 在其数据路径中大量使用 BPF，详情请参阅 eBPF 数据路径章节。本章的目标是提供一份 BPF 参考指南，以帮助理解 BPF 及其在网络中的具体应用，包括使用 tc（流量控制）和 XDP（快速数据路径）加载 BPF 程序，并为开发 Cilium 的 BPF 模板提供支持。
