@@ -39,9 +39,22 @@ for _, handler := range handlers {
 }
 ```
 
+通过比较annotations[eventHandledAnnotationKey] 是否等于 count来判断是否已经处理过
+
 # PodRoleEventHandler
 
-负责处理pod自身的ro
+某个角色切换的Event的message为：
+
+```
+ {
+    "event": "Success",
+    "operation": "checkRole",
+    "originalRole": "secondary",
+    "role": "{\"term\":\"1742497580554442\",\"PodRoleNamePairs\":[{\"podName\":\"XXXX\",\"roleName\":\"primary\",\"podUid\":\"c8451692-ee02-475c-8842-ee7c62349a1d\"}]}"
+}}
+```
+
+负责处理pod自身的role
 
 1. 提取probeEvent中的信息
 
@@ -52,4 +65,94 @@ for _, handler := range handlers {
    2. 获取对应的Pod，检查last-role-snapshot-version和
    3. 获取对应的InstanceSet，调用updatePodRoleLabel更新角色
 
+KubeBlocks依赖于Service的**selector**切换主备流量达到读写分离的目的，pod上角色标签的切换就是依赖这里的Handler完成
+
+这里看一下Event是如何发送的
+
+```
+// pkg/kbagent/service/probe.go
+go func() {
+    ticker := time.NewTicker(time.Duration(probe.ReportPeriodSeconds) * time.Second)
+    defer ticker.Stop()
+
+    var latestReportedEvent *proto.ProbeEvent
+    for range ticker.C {
+       latestEvent := gather(r.latestEvent)
+       if latestEvent == nil && latestReportedEvent != nil {
+          latestEvent = latestReportedEvent
+       }
+       if latestEvent != nil {
+          r.logger.Info("report probe event periodically",
+             "code", latestEvent.Code, "output", outputPrefix(latestEvent.Output), "message", latestEvent.Message)
+          r.sendEvent(latestEvent)
+       }
+       latestReportedEvent = latestEvent
+    }
+}()
+```
+
 # KBAgentTaskEventHandler
+
+目前的InstanceSet的副本扩缩容由Event机制进行通知，修改环境变量中的副本数
+
+KubeBlocks会在Transformer_component_workload.go中的scaleOut或者scaleIn中调用发送Event
+
+```
+parameters, err := component.NewReplicaTask(r.synthesizeComp.FullCompName, r.synthesizeComp.Generation, source, replicas)
+```
+
+KBAgentTaskEventHandler会根据env的不同状态处理
+
+```
+	finished := !event.EndTime.IsZero()
+	switch {
+	case finished && event.Code == 0:
+		err = handleNewReplicaTaskEvent4Finished(ctx, cli, its, event)
+	case finished:
+		err = handleNewReplicaTaskEvent4Failed(ctx, cli, its, event)
+	default:
+		err = handleNewReplicaTaskEvent4Unfinished(ctx, cli, its, event)
+	}
+```
+
+具体修改逻辑
+
+```
+parameters, err := updateKBAgentTaskEnv(obj.Data, func(task proto.Task) *proto.Task {
+       if task.Task == newReplicaTask {
+          replicas := strings.Split(task.Replicas, ",")
+          replicas = slices.DeleteFunc(replicas, func(r string) bool {
+             return r == event.Replica
+          })
+          if len(replicas) == 0 {
+             return nil
+          }
+          task.Replicas = strings.Join(replicas, ",")
+          if task.NewReplica != nil {
+             task.NewReplica.Replicas = task.Replicas
+          }
+       }
+       return &task
+    })
+    if err != nil {
+       return err
+    }
+    if parameters == nil {
+       return nil // do nothing
+    }
+
+    if obj.Data == nil {
+       obj.Data = make(map[string]string)
+    }
+    for k, v := range parameters {
+       obj.Data[k] = v
+    }
+    return cli.Update(ctx, obj, inDataContext())
+}(); err != nil {
+    return err
+}
+```
+
+# AvailableEventHandler
+
+修改Component的available状态

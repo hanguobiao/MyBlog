@@ -1,4 +1,17 @@
+---
+title: OpenTelemetry Collector 架构源码
+date: 2025-03-20
+update: 2025-03-21
+comment: false
+tags:
+  - OpenTelemetry
+categories:
+  - OpenTelemetry
+---
+
 OpenTelemetry Collector是OTel采集器的框架，提供了监控数据采集的一套标准框架
+
+*<!--more-->*
 
 ，定义了一套
 
@@ -32,6 +45,26 @@ main -> run(CollectorSettings) -> runInteractive(CollectorSettings) -> cmd.Execu
 
 
 ```
+
+# 启动流程
+
+云原生应用典型的以Cobra库构建命令行启动，通过cmd.Execute()，
+
+首先看一下OpenTelementry-Collector的核心类，从注释可以获取到Collector的处理流程
+
+收集器生命周期： 
+
+1. New 构造一个新的收集器。 
+2. Run 启动收集器。
+3. Run 调用 setupConfigurationComponents 处理配置。 
+4. 如果配置解析失败，收集器的配置可以重新加载。 
+5. 如果解析器收到关闭错误，收集器可以关闭。 
+6. Run 运行 runAndWaitForShutdownEvent 并等待关闭事件。 
+7. SIGINT 和 SIGTERM 信号、错误以及调用 (*Collector).Shutdown 可以触发关闭事件。 
+8. 关闭时，首先通知管道，然后关闭管道和扩展。 
+9. 用户可以随时调用 (*Collector).Shutdown 来关闭收集器。
+
+
 
 # 初始化Collector
 
@@ -264,23 +297,11 @@ func (col *Collector) reloadConfiguration(ctx context.Context) error {
 }
 ```
 
-# 启动流程
 
-云原生应用典型的以Cobra库构建命令行启动，通过cmd.Execute()，
 
-首先看一下OpenTelementry-Collector的核心类，从注释可以获取到Collector的处理流程
 
-收集器生命周期： 
 
-1. New 构造一个新的收集器。 
-2. Run 启动收集器。
-3. Run 调用 setupConfigurationComponents 处理配置。 
-4.  如果配置解析失败，收集器的配置可以重新加载。 
-5. 如果解析器收到关闭错误，收集器可以关闭。 
-6. Run 运行 runAndWaitForShutdownEvent 并等待关闭事件。 
-7. SIGINT 和 SIGTERM 信号、错误以及调用 (*Collector).Shutdown 可以触发关闭事件。 
-8. 关闭时，首先通知管道，然后关闭管道和扩展。 
-9. 用户可以随时调用 (*Collector).Shutdown 来关闭收集器。
+9. 
 
 ```
 // Collector represents a server providing the OpenTelemetry Collector service.
@@ -418,11 +439,26 @@ New
 
 graph.Build是构建OTel-Collector**数据流水线拓扑结构**的核心，主要负责解析配置文件中的接收器（Receivers）、处理器（Processors）、导出器（Exporters）和连接器（Connectors），并建立它们之间的逻辑关系，最终生成可执行的 **有向无环图（DAG）**
 
+graph的定义如下
+
+```
+type Graph struct {
+    // All component instances represented as nodes, with directed edges indicating data flow.
+    componentGraph *simple.DirectedGraph
+
+    // Keep track of how nodes relate to pipelines, so we can declare edges in the graph.
+    pipelines map[pipeline.ID]*pipelineNodes
+
+    // Keep track of status source per node
+    instanceIDs map[int64]*componentstatus.InstanceID
+
+    telemetry component.TelemetrySettings
+}
+```
 
 
 
-
-### service.Start
+# service.Start
 
 调用栈
 
@@ -436,6 +472,8 @@ Start
 |  |  |- comp.Start
 |- srv.host.ServiceExtensions.NotifyPipelineReady()
 ```
+
+这里是采集服务最终启动的位置
 
 
 
@@ -473,4 +511,3 @@ func (srv *Service) Start(ctx context.Context) error {
 }
 ```
 
-到此为止OTel-Collector已经启动了，接下来我们就看一个具体的Pipeline的例子，来理解数据采集和传输的过程
