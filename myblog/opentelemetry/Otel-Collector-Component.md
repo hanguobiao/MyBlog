@@ -1,13 +1,14 @@
----
-title: OpenTelemetry Collector Component源码
-date: 2025-03-20
-update: 2025-03-21
-comment: false
-tags:
-  - OpenTelemetry
-categories:
-  - OpenTelemetry
----
+- [ ] ---
+  title: OpenTelemetry Collector Component源码
+  date: 2025-03-20
+  update: 2025-03-21
+  comment: false
+  tags:
+    - OpenTelemetry
+  categories:
+    - OpenTelemetry
+  ---
+
 
 这里对一些关键的组件进行分析
 
@@ -258,3 +259,263 @@ func (h *handler) ListEndpoints() []observer.Endpoint {
     return endpoints
 }
 ```
+
+
+
+
+
+# Batch
+
+OTel-collector作为一个监控采集器，理所应当的会对监控数据进行削峰填谷的操作，来确保数据采集的稳定。
+
+batch就是一个常用的processor，用于收集一定数量的可观测数据，之后一起发送到Pipeline后面的流程
+
+## Start
+
+```
+
+```
+
+通过goroutines来确保batch启动
+
+```
+
+func (bp *batchProcessor[T]) Start(ctx context.Context, _ component.Host) error {
+	return bp.batcher.start(ctx)
+}
+
+func (sb *singleShardBatcher[T]) start(context.Context) error {
+	sb.single.start()
+	return nil
+}
+
+func (b *shard[T]) start() {
+	b.processor.goroutines.Add(1)
+	go b.startLoop()
+}
+```
+
+可以看到batch是通过b.newItem这个chan来获取到新的待处理对象，Loop的处理逻辑：
+
+1. 如果processor被关闭，仍然会处理完所有newItem中的对象
+2. newItem中有新对象到达，就调用processItem，如果itemCount >= sendBatchSize 就发送所有Items
+3. timerCh触发了超时那么就会发送所有Items，并resetTimer
+
+```
+func (b *shard[T]) startLoop() {
+    defer b.processor.goroutines.Done()
+
+    // timerCh ensures we only block when there is a
+    // timer, since <- from a nil channel is blocking.
+    var timerCh <-chan time.Time
+    if b.processor.timeout != 0 && b.processor.sendBatchSize != 0 {
+       b.timer = time.NewTimer(b.processor.timeout)
+       timerCh = b.timer.C
+    }
+    for {
+       select {
+       case <-b.processor.shutdownC:
+       DONE:
+          for {
+             select {
+             case item := <-b.newItem:
+                b.processItem(item)
+             default:
+                break DONE
+             }
+          }
+          // This is the close of the channel
+          if b.batch.itemCount() > 0 {
+             // TODO: Set a timeout on sendTraces or
+             // make it cancellable using the context that Shutdown gets as a parameter
+             b.sendItems(triggerTimeout)
+          }
+          return
+       case item := <-b.newItem:
+          b.processItem(item)
+       case <-timerCh:
+          if b.batch.itemCount() > 0 {
+             b.sendItems(triggerTimeout)
+          }
+          b.resetTimer()
+       }
+    }
+}
+```
+
+而消费函数consume就是将数据放入newItem当中
+
+```
+func (sb *singleShardBatcher[T]) consume(_ context.Context, data T) error {
+    sb.single.newItem <- data
+    return nil
+}
+```
+
+
+
+## sendItems
+
+当batch容量满或者触发了定时器的超时都会将当前队列中的数据进行发送，其中的b.batch.export实际上是调用了nextConsumer.ConsumeXXX，将数据传输到下一个消费者
+
+并且会通过batchProcessorTelemetry记录
+
+```
+func (b *shard[T]) sendItems(trigger trigger) {
+    sent, req := b.batch.split(b.processor.sendBatchMaxSize)
+
+    err := b.batch.export(b.exportCtx, req)
+    if err != nil {
+       b.processor.logger.Warn("Sender failed", zap.Error(err))
+       return
+    }
+    var bytes int
+    bpt := b.processor.telemetry
+
+    // Check if the instrument is enabled to calculate the size of the batch in bytes.
+    // See https://pkg.go.dev/go.opentelemetry.io/otel/sdk/metric/internal/x#readme-instrument-enabled
+    batchSendSizeBytes := bpt.telemetryBuilder.ProcessorBatchBatchSendSizeBytes
+    instr, ok := batchSendSizeBytes.(interface{ Enabled(context.Context) bool })
+    if !ok || instr.Enabled(bpt.exportCtx) {
+       bytes = b.batch.sizeBytes(req)
+    }
+
+    bpt.record(trigger, int64(sent), int64(bytes))
+}
+
+func (bl *batchLogs) export(ctx context.Context, ld plog.Logs) error {
+	return bl.nextConsumer.ConsumeLogs(ctx, ld)
+}
+
+```
+
+
+
+# memorylimiter
+
+batch通常会搭配memorylimiter来限制内存的使用，并在Pipeline中一般位于batch前面。作用是限制内存使用，避免OOM，这在使用Batch的场景下尤为重要
+
+从Start中可以看出MemoryLimiter会在定时器触发后调用CheckMemLimits检查内存占用
+
+```
+func (ml *MemoryLimiter) Start(_ context.Context, _ component.Host) error {
+    ml.refCounterLock.Lock()
+    defer ml.refCounterLock.Unlock()
+
+    ml.refCounter++
+    if ml.refCounter == 1 {
+       ml.closed = make(chan struct{})
+       ml.waitGroup.Add(1)
+       go func() {
+          defer ml.waitGroup.Done()
+
+          for {
+             select {
+             case <-ml.ticker.C:
+             case <-ml.closed:
+                return
+             }
+             ml.CheckMemLimits()
+          }
+       }()
+    }
+    return nil
+}
+```
+
+
+
+这里有个go语言运行时的调用，用于获取当前go程序所占用的Mem，比较有趣
+
+其中的systemstack的大概逻辑就是如果是普通 goroutine 栈中调用，则需要切换到 g0 栈执行函数，执行完成之后再切换回去。
+
+> g0 是每个 M 系统线程创建的第一个 goroutine，使用的是系统栈，并不是 runtime 维护的用户栈。g0 的主要职责为 goroutine 管理调度、goroutine 的创建、GC 扫描、栈扩容、defer 函数的初始化等。也就是说每当执行这些操作的时候，runtime 都会切换到 g0 栈上执行。
+
+### stopTheWorld
+
+1. 执行stopTheWorld
+   1. 获取worldsema全局锁
+   2. 标记当前的gp.m.preemptoff，禁止Machine被抢占
+   3. 切换到系统栈执行关键逻辑
+      1. 将状态迁移到**`_Gwaiting`**
+      2. **调用内部实现`stopTheWorldWithSema`**
+      3. 恢复**Goroutine**状态
+   4. 返回上下文，用于恢复
+
+### readmemstats_m
+
+1. 确认处于WorldStoppe
+
+2. systemstack(flushallmcaches)：遍历所有 P，将其 mcache 中未使用的 span 返还给 mcentral。清理stackcache
+
+3. 分层内存采集
+
+   - 大对象
+   - 分尺寸对象（**SizeClass**）
+   - 微对象
+
+4. ##### **计算全局指标**
+
+```
+	totalMapped := gcController.heapInUse.load() + gcController.heapFree.load() + gcController.heapReleased.load() +
+		memstats.stacks_sys.load() + memstats.mspan_sys.load() + memstats.mcache_sys.load() +
+		memstats.buckhash_sys.load() + memstats.gcMiscSys.load() + memstats.other_sys.load() +
+		stackInUse + gcWorkBufInUse + gcProgPtrScalarBitsInUse
+```
+
+5. ##### **一致性校验**
+
+6. 生成**MemStats**
+
+### startTheWorld
+
+
+
+```
+func ReadMemStats(m *MemStats) {
+	_ = m.Alloc // nil check test before we switch stacks, see issue 61158
+	stw := stopTheWorld(stwReadMemStats)
+
+	systemstack(func() {
+		readmemstats_m(m)
+	})
+
+	startTheWorld(stw)
+}
+```
+
+## CheckMemLimits
+
+在回到CheckMemLimits
+
+这里会校验之前在STW状态下读取的内存使用，
+
+1. 如果没有超过软限制就直接返回
+2. 超过软限制或者硬限制都会触发强制GC，但二者的冷却时间不同
+3. 通过修改ml.mustRefuse来改变consume时的行为
+
+# Consume
+
+memoryLimiterProcessor是通过processorhelper.NewLogs创建的，以log为例，就是当MustRefuse为true时，通过obsreporter记录并返回一个memorylimiter.ErrDataRefused，表示该记录被拒绝
+
+```
+func (p *memoryLimiterProcessor) processLogs(ctx context.Context, ld plog.Logs) (plog.Logs, error) {
+	numRecords := ld.LogRecordCount()
+	if p.memlimiter.MustRefuse() {
+		// TODO: actually to be 100% sure that this is "refused" and not "dropped"
+		// 	it is necessary to check the pipeline to see if this is directly connected
+		// 	to a receiver (ie.: a receiver is on the call stack). For now it
+		// 	assumes that the pipeline is properly configured and a receiver is on the
+		// 	callstack.
+		p.obsrep.refused(ctx, numRecords, pipeline.SignalLogs)
+		return ld, memorylimiter.ErrDataRefused
+	}
+
+	// Even if the next consumer returns error record the data as accepted by
+	// this processor.
+	p.obsrep.accepted(ctx, numRecords, pipeline.SignalLogs)
+	return ld, nil
+}
+
+```
+

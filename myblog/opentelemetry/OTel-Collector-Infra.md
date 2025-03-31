@@ -19,6 +19,14 @@ OpenTelemetry Collector是OTel采集器的框架，提供了监控数据采集�
 
 receiver -> processor -> exporter 
 
+
+
+这里的节点是实际上暴露给用户的，实际是Pipeline中还包括一些隐藏节点
+
+​                                                      extension
+
+receiver -> capabilitiesNode -> processor -> exporter -> fanOutNode
+
 的数据采集流
 
 具体实现上，整个框架采用插件化的思想，每个部分都可以采用组件库中现成的组件，或者自己编写的组件
@@ -511,3 +519,205 @@ func (srv *Service) Start(ctx context.Context) error {
 }
 ```
 
+
+
+# capabilitiesNode
+
+每条管道在receiver之后都有一个“虚拟”能力节点，为每条管道提供一个一致的“第一个消费者”
+
+使用了next初始化，等效于直接调用next
+
+```
+case *capabilitiesNode:
+    capability := consumer.Capabilities{
+       // The fanOutNode represents the aggregate capabilities of the exporters in the pipeline.
+       MutatesData: g.pipelines[n.pipelineID].fanOutNode.getConsumer().Capabilities().MutatesData,
+    }
+    for _, proc := range g.pipelines[n.pipelineID].processors {
+       capability.MutatesData = capability.MutatesData || proc.(*processorNode).getConsumer().Capabilities().MutatesData
+    }
+    next := g.nextConsumers(n.ID())[0]
+    switch n.pipelineID.Signal() {
+    case pipeline.SignalTraces:
+       cc := capabilityconsumer.NewTraces(next.(consumer.Traces), capability)
+       n.baseConsumer = cc
+       n.ConsumeTracesFunc = cc.ConsumeTraces
+    case pipeline.SignalMetrics:
+       cc := capabilityconsumer.NewMetrics(next.(consumer.Metrics), capability)
+       n.baseConsumer = cc
+       n.ConsumeMetricsFunc = cc.ConsumeMetrics
+    case pipeline.SignalLogs:
+       cc := capabilityconsumer.NewLogs(next.(consumer.Logs), capability)
+       n.baseConsumer = cc
+       n.ConsumeLogsFunc = cc.ConsumeLogs
+    case xpipeline.SignalProfiles:
+       cc := capabilityconsumer.NewProfiles(next.(xconsumer.Profiles), capability)
+       n.baseConsumer = cc
+       n.ConsumeProfilesFunc = cc.ConsumeProfiles
+    }
+```
+
+
+
+# fanOutNode
+
+在processor和Exporter之间，由于一个pipeline可以有多个Exporter，所以fanoutNode就是用于处理分发的情况
+
+New时，接收了所有的nextConsumer，把它们分为修改了数据和只读的情况
+
+```
+func NewLogs(lcs []consumer.Logs) consumer.Logs {
+    // Don't wrap if there is only one non-mutating consumer.
+    if len(lcs) == 1 && !lcs[0].Capabilities().MutatesData {
+       return lcs[0]
+    }
+
+    lc := &logsConsumer{}
+    for i := 0; i < len(lcs); i++ {
+       if lcs[i].Capabilities().MutatesData {
+          lc.mutable = append(lc.mutable, lcs[i])
+       } else {
+          lc.readonly = append(lc.readonly, lcs[i])
+       }
+    }
+```
+
+之后就是确定是否clone还是直接传输原始的数据
+
+```
+if len(lsc.mutable) > 0 {
+  // Clone the data before sending to all mutating consumers except the last one.
+  for i := 0; i < len(lsc.mutable)-1; i++ {
+    errs = multierr.Append(errs, lsc.mutable[i].ConsumeLogs(ctx, cloneLogs(ld)))
+  }
+  // Send data as is to the last mutating consumer only if there are no other non-mutating consumers and the
+  // data is mutable. Never share the same data between a mutating and a non-mutating consumer since the
+  // non-mutating consumer may process data async and the mutating consumer may change the data before that.
+  lastConsumer := lsc.mutable[len(lsc.mutable)-1]
+  if len(lsc.readonly) == 0 && !ld.IsReadOnly() {
+    errs = multierr.Append(errs, lastConsumer.ConsumeLogs(ctx, ld))
+  } else {
+    errs = multierr.Append(errs, lastConsumer.ConsumeLogs(ctx, cloneLogs(ld)))
+  }
+}
+
+// Mark the data as read-only if it will be sent to more than one read-only consumer.
+if len(lsc.readonly) > 1 && !ld.IsReadOnly() {
+  ld.MarkReadOnly()
+}
+for _, lc := range lsc.readonly {
+  errs = multierr.Append(errs, lc.ConsumeLogs(ctx, ld))
+}
+```
+
+
+
+# 失败重试
+
+exporter的对象可能数据库等，有可能存在问题导致某次发送请求失败，这是就需要一个失败重试机制来兜底，尤其是一些重要的数据，例如日志等。
+
+每个Exporter都继承自baseExporter，重试机制就在这里。开启重试的话baseExporter的firstSender就会设置为RetrySender，由RetrySender通过重试机制调用具体的firstSender
+
+```
+if be.retryCfg.Enabled {
+    be.RetrySender = newRetrySender(be.retryCfg, set, be.firstSender)
+    be.firstSender = be.RetrySender
+}
+```
+
+处理流程：
+
+1. ##### Backoff**策略初始化**
+
+2. 主循环调用rs.next.Send(ctx, req)，分析Err，下面的情况会抛出错误
+
+   - `err == nil` 时直接返回
+   - `consumererror.IsPermanent(err)` 识别（如4xx客户端错误）->不可重试错误直接抛出
+   -  `backoff.NextBackOff() == backoff.Stop`（间隔超过`MaxInterval`或被封顶）-> 抛出
+   - `maxElapsedTime`全局时间窗口过期
+   - 监听`ctx.Done()`信号
+   - 监听`rs.stopCh`（优雅关闭场景）
+
+3. 没有无法重复的错误，重复主循环
+
+```
+func (rs *retrySender) Send(ctx context.Context, req request.Request) error {
+    // Do not use NewExponentialBackOff since it calls Reset and the code here must
+    // call Reset after changing the InitialInterval (this saves an unnecessary call to Now).
+    expBackoff := backoff.ExponentialBackOff{
+       InitialInterval:     rs.cfg.InitialInterval,
+       RandomizationFactor: rs.cfg.RandomizationFactor,
+       Multiplier:          rs.cfg.Multiplier,
+       MaxInterval:         rs.cfg.MaxInterval,
+    }
+    span := trace.SpanFromContext(ctx)
+    retryNum := int64(0)
+    var maxElapsedTime time.Time
+    if rs.cfg.MaxElapsedTime > 0 {
+       maxElapsedTime = time.Now().Add(rs.cfg.MaxElapsedTime)
+    }
+    for {
+       span.AddEvent(
+          "Sending request.",
+          trace.WithAttributes(attribute.Int64("retry_num", retryNum)))
+
+       err := rs.next.Send(ctx, req)
+       if err == nil {
+          return nil
+       }
+
+       // Immediately drop data on permanent errors.
+       if consumererror.IsPermanent(err) {
+          return fmt.Errorf("not retryable error: %w", err)
+       }
+
+       if errReq, ok := req.(request.ErrorHandler); ok {
+          req = errReq.OnError(err)
+       }
+
+       backoffDelay := expBackoff.NextBackOff()
+       if backoffDelay == backoff.Stop {
+          return fmt.Errorf("no more retries left: %w", err)
+       }
+
+       throttleErr := throttleRetry{}
+       if errors.As(err, &throttleErr) {
+          backoffDelay = max(backoffDelay, throttleErr.delay)
+       }
+
+       nextRetryTime := time.Now().Add(backoffDelay)
+       if !maxElapsedTime.IsZero() && maxElapsedTime.Before(nextRetryTime) {
+          // The delay is longer than the maxElapsedTime.
+          return fmt.Errorf("no more retries left: %w", err)
+       }
+
+       if deadline, has := ctx.Deadline(); has && deadline.Before(nextRetryTime) {
+          // The delay is longer than the deadline.  There is no point in
+          // waiting for cancelation.
+          return fmt.Errorf("request will be cancelled before next retry: %w", err)
+       }
+
+       backoffDelayStr := backoffDelay.String()
+       span.AddEvent(
+          "Exporting failed. Will retry the request after interval.",
+          trace.WithAttributes(
+             attribute.String("interval", backoffDelayStr),
+             attribute.String("error", err.Error())))
+       rs.logger.Info(
+          "Exporting failed. Will retry the request after interval.",
+          zap.Error(err),
+          zap.String("interval", backoffDelayStr),
+       )
+       retryNum++
+
+       // back-off, but get interrupted when shutting down or request is cancelled or timed out.
+       select {
+       case <-ctx.Done():
+          return fmt.Errorf("request is cancelled or timed out: %w", err)
+       case <-rs.stopCh:
+          return experr.NewShutdownErr(err)
+       case <-time.After(backoffDelay):
+       }
+    }
+}
+```
