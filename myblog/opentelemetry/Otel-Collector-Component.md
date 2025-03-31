@@ -1,13 +1,13 @@
-- [ ] ---
-  title: OpenTelemetry Collector Component源码
-  date: 2025-03-20
-  update: 2025-03-21
-  comment: false
-  tags:
-    - OpenTelemetry
-  categories:
-    - OpenTelemetry
-  ---
+---
+title: OpenTelemetry Collector Component源码
+date: 2025-03-20
+update: 2025-03-21
+comment: false
+tags:
+  - OpenTelemetry
+categories:
+  - OpenTelemetry
+---
 
 
 这里对一些关键的组件进行分析
